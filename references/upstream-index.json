@@ -1,0 +1,17 @@
+{
+  "repos": {
+    "bethington/ghidra-mcp": "references/upstream/bethington--ghidra-mcp",
+    "boykopovar/AnyPS5": "references/upstream/boykopovar--AnyPS5",
+    "Freakmenn/ai-game-modding-guides": "references/upstream/Freakmenn--ai-game-modding-guides",
+    "HexRaysSA/ida-mcp": "references/upstream/HexRaysSA--ida-mcp",
+    "icsharpcode/ILSpy": "references/upstream/icsharpcode--ILSpy",
+    "morluto/rea": "references/upstream/morluto--rea",
+    "NousResearch/hermes-official-plugins": "references/upstream/NousResearch--hermes-official-plugins",
+    "rehan-remade/universal-modder": "references/upstream/rehan-remade--universal-modder",
+    "SamboyCoding/Cpp2IL": "references/upstream/SamboyCoding--Cpp2IL",
+    "yuriolive/PortPS5": "references/upstream/yuriolive--PortPS5"
+  },
+  "aliases": {
+    "trevaintdead/ai-game-modding-guides": "Freakmenn/ai-game-modding-guides"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "checked_on": "2026-10-18",
+  "rea_version": "6.7.0",
+  "rea_integrity": "sha512-yhIx2ioJYYT1C/tONfYeitC6LhnKmCh+ZwRUOgYuhSc733lGhkkt73zhug9WmLgxoMdKuqIYGCoBfD4fXkOhFw==",
+  "node_version": "v24.22.0",
+  "ilspy_version": "11.1.0.9782",
+  "universal_dependencies": [
+    "pillow==12.0.0",
+    "numpy==2.2.6",
+    "pyyaml==6.0.3"
+  ],
+  "ghidra": {
+    "version": "12.1.4",
+    "url": "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip",
+    "sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
+  },
+  "jadx": {
+    "version": "1.5.6",
+    "url": "https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip",
+    "sha256": "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974"
+  }
+}

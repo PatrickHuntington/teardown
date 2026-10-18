@@ -1,0 +1,385 @@
+# PortPS5 — Spec: Shader recompiler
+
+Status: draft v1 · 2026-09-27 · synced with `main` 2026-10-01
+
+Deepens the decision table in [README.md](README.md#subsystem-specs). The decisions recorded there are fixed: keep the pipeline, replace the structurizer's failure path, add a subgroup-size path and tests, and leave AOT post-1.0. Paths are relative to AnyPS5 `core/shader/recompiler/` unless prefixed. `main@e06dbff` is the pre-merge AnyPS5 main (the old baseline). `main@75a8668` is current AnyPS5 main, which includes merged PR #5. Its delta column cites `main@75a8668`. Anything marked *(inferred)* was not observed at runtime.
+
+## Scope
+
+Everything from a `RecompileRequest` (RDNA2 code, guest register context, a memory view, a host target) to validated SPIR-V plus binding metadata:
+
+- RdnaDecoder, CFG build and Structurizer;
+- InstructionTranslator, IR (IrOpcode, IrBlock, SSA builder, `ValidateProgram`) and the optimization passes;
+- SrtWalker and resource planning (`IrResourcePlan`, `pureFlatSlots`, ResourceMaterializer);
+- the SpirvBackend (SpirvEmitter, SpirvModule, SpirvMemory, SpirvSubgroup, SpirvBda*);
+- the SPIRV-Tools optimizer, source and variant caching, RequestSerializer, and the `agc_shader_replay` tool.
+
+Out of scope: PM4 parsing, descriptor upload and pipeline creation ([gpu-driver.md](gpu-driver.md)), and on-disk persistence ([pipeline-cache.md](pipeline-cache.md)).
+
+## Current state
+
+`core/shader` is about 33.8k lines across 206 files at `main@e06dbff` and 35,950 lines across 208 files at `main@75a8668` (`git ls-files`, summed line count). PR #5 branched from `40df528`, and main made no commits under `core/shader` between `40df528` and `e06dbff`. PR #5 changed the recompiler in exactly two commits, both now ancestors of `main@75a8668`: `87911b3` (+977/−112, 38 files) and `29b4601` (+1343/−259 under `core/shader`). Sixteen later commits touch `core/shader` (translator fixes and additions from other contributors, for example `S_CLAUSE`, `V_PERM_B32` and `s_getpc_b64`). `core/shader` contains 0 `getenv` calls at `main@e06dbff` and 33 at `main@75a8668`.
+
+| # | Stage | `main@e06dbff` (file:line) | `main@75a8668` delta (merged PR #5) | Target |
+|---|---|---|---|---|
+| 1 | Decode | `RdnaInstructionDecoder` (`Recompiler.cpp:66-67`). About 560 `RdnaOpcode` entries (grep count). An unknown opcode throws at translation (`Translation/src/DispatchInstructions.cpp:19`). | SMEM with a VCC base; f16 conversion opcode fix (`87911b3`) | Keep. Add per-opcode coverage counters for the corpus. |
+| 2 | CFG | `GraphBuilder` (`Recompiler.cpp:69-70`) | none | Keep. |
+| 3 | Structurize | `Structurizer::Structurize` (`ControlFlow/src/Structurizer.cpp:581-627`). It has 11 `throw` sites (lines 476, 593, 600, 603, 621, 819, 829, 843, 858, 862, 875). Irreducible control flow is flagged at :765 and rejected at :875. Block cloning is disabled (:476). | identical file | Add a goto-elimination fallback (§Target design 1). |
+| 4 | Translate | `InstructionTranslator` (`Recompiler.cpp:93`), then `ValidateProgram(program, false)` (`Translation/src/InstructionTranslator.cpp:438`) | saveexec order (`Translation/src/ControlFlowInstructions.cpp:18-31`), `v_movrels`/`v_movreld` lowering (:243-270) | Port both fixes and remove their env switches. The saveexec order and per-lane EXEC bit are ported (PortPS5 lane E, no env switch); see [Upstream ports, lane E](#upstream-ports-lane-e). |
+| 5 | SSA | Braun-style construction: sealing in `IrBlock.hpp:32-45`, `TryRemoveTrivialPhi` at `Optimization/src/SsaBuilder/SsaPass.cpp:103` | none | Keep. Add synthetic flag variables (§1). |
+| 6 | Cleanup | `ConstantFolder`, `ResolveControlFlowIdentities`, `DeadCodeEliminator`, `ReadLaneEliminator` (`Recompiler.cpp:98-113`). `SharedMemoryBarrierInserter` is a 10-line stub that nothing calls. | ReadLaneEliminator +92 lines | Keep. Delete the stub. |
+| 7 | SRT and resource tracking | `SrtWalker::BuildPlan` and `ResourceTracker::Track` (`Recompiler.cpp:115-121`) | flat-slot classes (`SrtFlatSlotClasses.cpp`, new); `pureFlatSlots` (`IrMetadata/ResourcePlan.hpp:66`) | Port. |
+| 8 | Plan and materialize | `ResourceMaterializer::ExtractPlan` and `Materialize` (`Recompiler.cpp:137,287`) | bindless image tables with fixed caps: `APS5_BINDLESS_SLOTS`, default 16 (`ResourceMaterializer.cpp:855-862`), and `APS5_BINDLESS_MATERIAL_SCAN`, default 256 (:183-191) | Derive the bounds from device limits (§4). |
+| 9 | Source and variant cache | The source key is every code word plus the context and target (`CacheKey.hpp:12-23`). Variants are found by **linear scan** and never bounded, and the compile runs **under the source mutex** (`Recompiler.cpp:290-303`). Nothing persists. | The code enters the key as length plus a 64-bit hash and is verified word by word (`CacheKey.hpp:16-25`, `Recompiler.cpp:222-273`). A result memo holds 256 LRU entries (:409). There is a plan-failure memo (:190,263-268). Variants are still a linear scan (:494-504). | Bounded, hash-indexed lookup that compiles outside the lock (§3). |
+| 10 | Bind | `ShaderInfoCollector`, `BindingAllocator`, `DescriptorBindingBuilder` (`Recompiler.cpp:203-210`) | written/atomic flags on `DescriptorBinding` | Port. |
+| 11 | Emit | `SpirvEmitter::Emit` (`SpirvBackend/src/SpirvEmitter.cpp:205-222`). `laneCount = 2` when a wave64 program meets a 32-wide host (:217). On `main@e06dbff`, `hostSubgroupSize` keeps its default of 64 (`ShaderStageInputInfo.hpp:92`) and is never assigned, so the two-lane path is unreachable *(inferred from grep)*. | `HostSubgroupSize(request)` plumbs `target.subgroupSize` through (`Recompiler.cpp:72-82`). `WaveLdsScope` wave-LDS ordering barriers (`SpirvEmitter.cpp:41-67`). Atomic-zero skip (`SpirvMemory/SpirvMemoryInstructions.cpp:730-751`). | Port. Add a subgroup-size-control path (§2). |
+| 12 | Validate and optimize | `ValidateAndOptimizeSpirv` (`SpirvBackend/src/SpirvOptimizer.cpp:9-57`) runs validate, then `RegisterPerformancePasses`, then validate again. It is compiled only with `ANYPS5_ENABLE_SPIRV_TOOLS`, which defaults to OFF (`CMakeLists.txt:164-168`). | per-function pass list | ON in the `dev` and `ci` presets. The release default is currently off, pending PRD R1. |
+
+Other facts:
+
+- **Driver target.** The driver builds its target as Vulkan 1.3 with SPIR-V 1.3, or 1.4 when mesh shaders are used (`libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp`, `VulkanDevice::Target`). It stays below 1.6 until the subgroup size is pinned per pipeline ([gpu-driver.md](gpu-driver.md) Open questions), because the lane math assumes a fixed `target.subgroupSize`. `ValidateAndOptimizeSpirv` already maps Vulkan 1.3 and 1.4 to a SPIR-V 1.6 ceiling and rejects a 1.6 target under a 1.1 or 1.2 environment.
+- **Serialization.** `RequestSerializer` writes magic `0x41505335`, version 2, as base64 (`ControlFlow/src/RequestSerializer.cpp:659-693`). `Recompile` appends the serialized request to every exception (`Recompiler.cpp:318-327`).
+- **Replay tool.** `agc_shader_replay` (`core/libs/prx/libSceAgcDriver/tools/AgcShaderReplay.cpp`,
+  `agc_shader_replay` CMake target, dev/ci presets only, never shipped) replays serialized
+  `.req` requests through `Recompile`, prints RDNA disassembly (`--dis`), SPIR-V assembly
+  (`--asm`) and the snapshot summary (`--mem`), and verifies a corpus directory
+  (`--golden <dir>`, with deliberate regeneration via `--update-goldens`). It carries no
+  `APS5_*` environment switches (explicit flags only) and returns codes, never throwing
+  across boundaries. `Deserialize.cpp` remains an unbuilt standalone diagnostic.
+- **Tests.** Recompiler-owned test targets (both in ctest):
+  - `recompiler_fixes_tests` (label `unit`): saveexec order, atomic-zero, `v_movrels`/`v_movreld`, wave-LDS barriers;
+  - `recompiler_ported_instruction_tests` (label `unit`): decode, translate and *interpret* hand-assembled synthetic
+    instructions against the RDNA2 ISA pseudo-code (lane E ports below);
+  - `recompiler_golden_tests` (label `golden`, `ctest --preset golden`): the synthetic corpus
+    coverage gate plus wave32/wave64 replay of every case (see Tests below).
+  The driver tests that touch the recompiler are:
+  - `agc_shader_memory_tests`, which is in ctest and checks the serializer round-trip and the cache policy;
+  - `agc_driver_recompiler_tests`, registered through `portps5_add_gtest` with label `lavapipe` (PR #80), so it runs in the hosted `driver_lavapipe` job.
+- **glslang.** `tests/DummyShaders.cpp` is compiled into the recompiler static library and pulls glslang in as a link dependency (`CMakeLists.txt:136,158-162`). Nothing references it outside the file, so the static archive probably drops it *(inferred)*.
+
+### Upstream ports, lane E
+
+Shader-recompiler small fixes reviewed against the public RDNA2 ISA and ported from AnyPS5 `main`
+(PortPS5 branch `feat/port-shader-small`). Every ported item has a semantic test in
+`recompiler_ported_instruction_tests` that decodes the synthetic instruction, translates it and executes the
+emitted IR against an independent C++ statement of the ISA pseudo-code. No game data is involved.
+
+| Upstream | Decision | Notes |
+|---|---|---|
+| `730de17` V_PERM_B32 | PORT | Byte select over `{S0:S1}`: sel 0-7 byte, 8-11 sign of bytes 1/3/5/7, 12 zero, >=13 0xff. Tested for all 256 selector values in each byte position. |
+| `80a64cc` IR value equality | PORT | `IrValue::operator==` now compares `flags`. |
+| `87911b3` saveexec order, atomic-zero, cache keys, env switches | PORT ADAPTED (saveexec only) | Source is read before the old EXEC is written to D (aliased `vcc, vcc` form), and the per-lane EXEC bit is the lane's own bit of the new mask. The upstream `APS5_SAVEEXEC_WRITE_FIRST` switch is dropped. f16 widening/narrowing opcode direction fix also ported (see `4ea1209`). Atomic-zero rewrite, per-function pass list, probes and `APS5_*` reads: SKIP (see Open questions 8-9). |
+| `198b43c` 64-bit saveexec | PORT | S_OR/S_XOR/S_ANDN2_SAVEEXEC_B64 (SOP1 0x25-0x27). ANDN2 is `S0 & ~EXEC`. |
+| `2e398be` S_CMOV_B32, S_BCNT0_I32_B32, S_FF0_I32_B32 | PORT | SCC untouched by cmov/ff0; bcnt0 sets SCC = (count != 0). |
+| `f7f60b4` S_SEXT_I32_I8/I16 | PORT | Sign extension of the low byte/halfword, SCC untouched. |
+| `86401fe` S_BREV_B64, S_ASHR_I64 | PORT ADAPTED | Dword swap plus per-dword bit reverse; arithmetic shift count is `S1[5:0]`, SCC = (D != 0). Adapted: a 32-bit *literal* source of the signed `s_ashr_i64` is sign-extended (the B64 bitwise ops zero-extend), and all sources are read before the destination/SCC write (aliasing), per hardware-validated expectations in the KytyPS5 suite. |
+| `e2c426f` S_BITCMP0/1_B64 | PORT | Bit index is `S1[5:0]`. |
+| `24c163b` S_CLAUSE | PORT | No-op scheduling hint. |
+| `28bfe77` SDWA selectors on V_BFREV_B32 / V_FFBH_U32 | PORT | Decoder rule plus a diagnostic that names selector, opcode and pc. |
+| `5fdcd57` widen 64-bit constants | PORT ADAPTED | Literal zero-extends (except the signed `s_ashr_i64`, which sign-extends), integer inline sign-extends, float inline becomes the double. 1/(2*pi) uses the exact double constant (`0x3fc45f306dc9c883`), not the widened float. |
+| `4ea1209` f16 inline constants and VOP3 f16 op_sel | PORT ADAPTED | Adds the f16 widening/narrowing conversion opcode fix from `87911b3` (the translator used the wrong direction, so every f16 read was rejected by the IR builder). Unknown constants throw `std::invalid_argument`, not `runtime_error`. |
+| `d9ac21c` s_getpc_b64 absolute address | SKIP | Already in tree (`5d6c2881`, `SGetpcB64AddsShaderBaseToNextPc`). Its AGC driver test is outside this lane. |
+| `8cef034` compiler thread-local storage | PORT ADAPTED | The recompiler's `thread_local` objects with destructors (`getSource` key vector, and the vertex/pixel/compute input-info scratch in `ShaderInputInfoBuilder`; `ShaderVertexInputInfo` is not trivially destructible) move to `HostThreadLocal`. The upstream `CacheKey.hpp` / `SrtDescriptorEvaluation.cpp` sites do not exist here. The hazard (a TLS-exit destructor on a guest-hosting thread) cannot be provoked on hosted CI, so the test is a per-thread-isolation regression guard. |
+| `5a257be` S_CBRANCH_CDBG* | PORT | Never taken on a retail wave; emits no IR and does not split the CFG, so a debugger stub placed past `s_endpgm` stays unreachable (SharpEmu `Gen5ShaderDecoderBoundaryTests` expectation). |
+| `8e66145` MIMG UNORM / `_a` aliases / LOD clamp / VOP3 carry-in / MRT export format | PORT ADAPTED (two parts) | Ported: UNORM accepted on non-sampling MIMG ops (the ISA requires it on stores and atomics), and VOP3 `v_add/sub/subrev_co_ci_u32` carry/borrow-in from the src2 SGPR pair. Deferred: `_a` sample aliases (not verifiable from the public ISA), LOD clamp (needs `shaderResourceMinLod` plumbing), MRT export component masks (the MRT masks were ported in [lane E2](#upstream-ports-lane-e2)). |
+| `bb60336` disk-cache keys | SKIP | `ShaderDiskCache` does not exist in this tree (pipeline cache is M2). |
+| `5693c77` BDA lookup not inlined | PORT | `get_bda_pointer` carries the `DontInline` function control. |
+
+### Upstream ports, lane E2
+
+Second batch of recompiler ports from AnyPS5 `main` (PortPS5 branch `feat/port-shader-batch2`). Same method as lane E:
+each candidate is reviewed against the public RDNA2 ISA and our design, and every ported change has a synthetic,
+hand-assembled test in `recompiler_ported_instruction_tests` that is proven to fail without the fix (mutation check).
+The harness gained a wave-wide VGPR file with an independent DPP model, a SPIR-V word-stream inspector and
+`TryTranslate`/`CompileOrFail` wrappers (an exception escaping a TEST body ends the whole binary in this target).
+
+| Upstream | Decision | Notes |
+|---|---|---|
+| `d76ecfa` DPP row/bank masks gate the VGPR write | PORT (real bug on main) | `destinationOperand` was never called, so `DppUpdateU32` was dead and every DPP write ignored `row_mask`, `bank_mask` and `bound_ctrl`. `TranslateInstruction` now gives the destination its source's DPP fields; mac/fmac/dot2c read the accumulator through `accumulatorOperand` (no DPP). Upstream's test (`agc_dpp_write_tests`) only looked for an IR opcode; ours checks every lane's result against the ISA over several controls, masks and `bound_ctrl`. |
+| `8e66145` MRT export component masks, SNORM16 | PORT | `SPI_SHADER_COL_FORMAT` 32_R/32_GR/32_AR export only R / R,G / R,A of a 32-bit export (rest read 0, alpha 1) and a compressed export with format 6 is `UnpackSnorm2x16` (it took the half-float path). |
+| `8e66145` `_a` sample aliases | SKIP | The `_a` forms are not in the public RDNA2 ISA; the claim that they keep the plain address layout rests on one other emulator. Not ported until it can be checked against hardware docs. |
+| `8e66145` `_cl` LOD clamp | DEFER | Needs the device's `shaderResourceMinLod` listed in `SpirvTarget::supportedCapabilities` (AGC driver). Today `_cl` forms are rejected loudly by the decoder, which stays correct. Follow-up: driver hook, then decoder + `MinLod` image operand. |
+| FP64 operand with a literal | N/A (documented) | The tree has no 64-bit float opcode (no `*F64` in `RdnaOpcode`), so nothing consumes `readU32Pair` as a double. Contract recorded in Open questions 8: a future f64 consumer must take the literal as the high dword. |
+| `s_bcnt0_i32_b64`, `s_ff0_i32_b64`, `s_or/xor/andn2_saveexec_b32` | PORT | SOP1 0x0e, 0x12, 0x3d, 0x3e, 0x3f. bcnt0 sets SCC = (D != 0); ff0 leaves SCC; the saveexec forms share `sSaveexec` (source read before the old EXEC is written, per-lane EXEC bit). |
+| `28b09d4` GLC/DLC buffer accesses are coherent | PORT ADAPTED | Decoder reads DLC (MUBUF/MTBUF word 0 bit 15); a buffer load or store with GLC or DLC is `MemoryInfo::coherent`, its guest buffers are decorated `Coherent` and its accesses `Volatile`. Atomics are excluded (GLC only returns the pre-op value). The BDA half of upstream (`BdaAccessMask`) depends on the GPU-descriptor path that is deferred below. FLAT GLC/DLC is not mapped yet (Open questions 10). |
+| `6a73ec4` selection whose arm continues | PORT | Inside a loop, an arm that reaches the post-dominator only past the continue/merge block leaves the selection by continuing; the merge is the other arm's target. Test: the smallest CFG that used to exhaust the split budget (hand-built blocks, no shader). |
+| `cd158c6` BDA fault in a continue target | PORT ADAPTED | Reproduced on main: a loop whose body is the continue target and loads through BDA failed pre-optimization `spirv-val` ("continue construct ... not structurally post dominated"). `SpirvEmitterState::bdaStopsInvocations` (our tree has no wave-LDS flag of that name) is cleared while a continue target is emitted; there the read is guarded so an unmapped or overflowed address reads zero instead of dereferencing a null pointer (upstream relies on its own per-byte guard), and a wrapped address from an overflowing add or subtract is replaced by the all-ones address, which the read's overflow check turns into a zero read (`SpirvBackend/src/SpirvBdaRead.cpp:20-26`, test `WrappedBdaAddressInContinueTargetIsPoisoned`). The optimizer-pass interaction found while testing is Open questions 11. |
+| `21cb5676` buffer access through GPU-computed V#s | DEFER | Needs the BDA ABI to carry a written-page set behind the fault record and the host to mark those pages GPU-written (`BdaAbi.hpp` plus `libSceAgcDriver/Graphics/*`). A recompiler-only port would write into memory the driver does not allocate. Follow-up for the AGC driver owner. |
+| `74454ee` scalar buffer loads through a GPU-selected V# | DEFER | Builds on `21cb5676` (`MemoryInfo::gpuDescriptor` does not exist here). |
+| `3d3f7122` V# at address 0 accesses nothing, `029dcdac` null V# accesses nothing | DEFER | Driver-side descriptor handling (`Graphics/src/ShaderResources.cpp`, `Draw.cpp`); out of lane, and `3d3f7122` also builds on the deferred GPU-descriptor path. |
+| `000d0bf` retire threads past a partial thread-dimension dispatch | DEFER | The mechanism is general (RDNA2 `USE_THREAD_DIMENSIONS` launches a partial last workgroup), but it only works with the dispatch size from the PM4 packet, which is read in `Execution/src/Driver.cpp`, and with a serializer version bump and a shader-data layout change. The recompiler half would be dead code without the driver half. Follow-up: one PR across both. |
+| `c1692bf` D32 depth plane read as a 32-bit integer | DEFER | Depends on `DepthSurface.cpp` and the depth/stencil work (PR #55 area). |
+| `9bb9416` `image_bvh_intersect_ray` node test, `976fa82` ray tracing miss fallback | SKIP | Ray tracing appears nowhere in the PRD or ROADMAP scope and `9bb9416` is a large port of AMD's GPURT software fallback through another emulator. `976fa82` is behaviour-changing through the `APS5_RAYTRACING` environment variable, which is rejected (`no-title-hacks.md`). Today `0xe6` is not decoded and fails loudly at translation, which is the right behaviour. |
+| `cf202b3` SRT handle-invariance guard | SKIP | Not reproducible: `IrValue::HasImmediate` is true only for constants and `Resolve` follows identities only, so a phi that merges a constant with a per-invocation value never reports an immediate. The first pass already requires `RuntimeValidator`. |
+| `cf202b3` BVH ray-query stub | SKIP | Returns an invented "miss" encoding (`0xFFFFFFFF`) and hides an unimplemented opcode; unsupported states abort loudly here. |
+| `cf202b3` rect-list interpolant truncation, SPIR-V 1.5 ceiling | SKIP | Silently dropping interpolants to make a draw succeed is the "skip work that fails" pattern (`no-title-hacks.md`); the SPIR-V version ceiling landed with the Vulkan 1.3 floor (#62). |
+| `87911b3` atomic-zero rewrite | SKIP (unchanged) | Still title-tuned; see Open questions 9. |
+| `4ea1209` f16 follow-ups | none remaining | Ported in lane E. |
+
+Reviewed, not ported, outside this task's list: `33f91099` (NGG to mesh shader translation: new feature, needs mesh pipeline support in the driver),
+`bbf430e2` (16-bit depth integer reads, depth/stencil lane), `cf721a27`/`bb60336a` (shader disk cache, M2), `f98b28d0` and `3dec6ced` (AGC driver).
+
+### Decode coverage versus reference projects
+
+Measured on 2026-10-01 with `tools/compare_isa.py`, against AnyPS5 `709d7fe`, KytyPS5 `4428640` and SharpEmu `e007d43`. The tool maps each project's decoder opcode names onto `tools/rdna_isa.txt`. It compares names only and copies no code, so read the results as an estimate. A decoder opcode that covers several encodings needs a one-to-many alias in `tools/progress.py` (`SCbranchCdbg` covers the four `S_CBRANCH_CDBG*` branches).
+
+PortPS5 decodes 595/1166. References: AnyPS5 608 (18 not in PortPS5), KytyPS5 590 (44 not in PortPS5), SharpEmu 683 (180 not in PortPS5).
+Decoded by at least one reference but not PortPS5: 198 (36 by two or more).
+
+| Encoding | Missing | Agreed by 2+ | Examples |
+|---|---|---|---|
+| VOPC | 64 | 20 | `V_CMPX_EQ_I16`, `V_CMPX_EQ_I64`, `V_CMPX_EQ_U16`, `V_CMPX_EQ_U64` |
+| MIMG | 52 | 5 | `IMAGE_ATOMIC_CMPSWAP`, `IMAGE_ATOMIC_DEC`, `IMAGE_ATOMIC_FCMPSWAP`, `IMAGE_ATOMIC_FMAX` |
+| VOP3 | 17 | 2 | `V_ADD_CO_U32`, `V_ADD_F64`, `V_FMA_F64`, `V_MAD_I16` |
+| SOPK | 13 | 0 | `S_ADDK_I32`, `S_CMPK_EQ_I32`, `S_CMPK_EQ_U32`, `S_CMPK_GE_I32` |
+| MUBUF | 11 | 0 | `BUFFER_ATOMIC_AND_X2`, `BUFFER_ATOMIC_DEC`, `BUFFER_ATOMIC_INC`, `BUFFER_LOAD_SBYTE_D16` |
+| GLOBAL | 9 | 0 | `GLOBAL_ATOMIC_ADD`, `GLOBAL_LOAD_SBYTE_D16`, `GLOBAL_LOAD_SBYTE_D16_HI`, `GLOBAL_LOAD_SHORT_D16` |
+| SOP1 | 9 | 0 | `S_NAND_SAVEEXEC_B32`, `S_NAND_SAVEEXEC_B64`, `S_NOR_SAVEEXEC_B32`, `S_NOR_SAVEEXEC_B64` |
+| VOP1 | 9 | 4 | `V_CVT_F32_F64`, `V_CVT_F64_F32`, `V_CVT_F64_I32`, `V_CVT_F64_U32` |
+| DS | 8 | 4 | `DS_ADD_U64`, `DS_CMPST_B32`, `DS_CMPST_RTN_B32`, `DS_DEC_U32` |
+| VOP2 | 3 | 1 | `V_FMAC_F32`, `V_MUL_HI_I32_I24`, `V_MUL_HI_U32_U24` |
+| SMEM | 1 | 0 | `S_MEMREALTIME` |
+| SOP2 | 1 | 0 | `S_BFE_I64` |
+| VOP3P | 1 | 0 | `V_FMA_MIX_F32` |
+
+Group beans, with the agreed names first: `portps5-gzgk` (VOPC), `portps5-a2u2` (MIMG), `portps5-dpay` (SOPK), `portps5-naoi` (D16), `portps5-p22g` (SAVEEXEC), `portps5-j0i5` (F64), `portps5-kc2b` (DS), `portps5-3fi7` (S_MEMREALTIME). The BVH ray ops are 2.0 work (`portps5-jehk`). Re-run with:
+
+```bash
+python tools/compare_isa.py --anyps5 <path> --kyty <path> --sharpemu <path>
+```
+
+## Decision
+
+- **Keep** the pipeline shape.
+- **Adopt from AnyPS5 main (merged PR #5):** all of `87911b3`, plus the flat-slot classes and hashed source key from `29b4601`. Every `APS5_*` read is removed or moved into the typed `[debug]` config.
+- **Reject:**
+  - the plan-failure memo, in any form: a recompile or plan failure logs once with the program hash and aborts via `Unsupported()`, with no skip, memo or counted tolerance in any mode;
+  - the fixed bindless caps;
+  - title identifiers in comments (for example `Recompiler.cpp:189`).
+- **Add:**
+  - a structurizer fallback that always succeeds;
+  - `VK_EXT_subgroup_size_control`;
+  - a bounded, hash-indexed variant index;
+  - the stable `SourceKey` and `VariantKey` defined in [pipeline-cache.md](pipeline-cache.md#target-design);
+  - a kernel-idiom analysis for the driver (`KernelIdiom`);
+  - the driver-side data paths: V#/SRT loads on the GPU through BDA, SGPRs from a user-data buffer, and the descriptor-heap hash probe;
+  - the synthetic and local corpora.
+
+## Target design
+
+**1. Structurizer fallback.**
+
+- `Structurize` becomes `StructurizeResult Structurize(ControlFlowGraph&)`. Tier 1 is the existing algorithm, with every `throw` turned into a returned `Unstructurable{reason, block}`.
+- On failure, tier 2 runs over the **original** CFG, a copy taken before tier 1 mutates it. Tier 2 is goto elimination in the Erosa–Hendren style (the 1994 "Taming Control Flow" paper). Yuzu and shadPS4 use the same family *(external, not checked here)*.
+- Tier 2 algorithm:
+  1. Build a statement tree in which every CFG edge that is not a structured fall-through becomes a `goto L`.
+  2. Move each goto outward or inward until it is a sibling of its label, rewriting as it goes: `if (c) goto L` becomes `flag_L = c; if (!flag_L) {…}`, and a goto that crosses a loop becomes `flag_L = c; break`.
+  3. Replace the sibling goto with a conditional over the statements in between. For a backward goto, wrap them in `do {…} while (flag_L)`.
+  4. Irreducible regions need no special case, because flags break every multi-entry cycle.
+- Flags are new SSA variables with a synthetic slot class `SsaVariable::Kind::Flag`, next to the SGPR/VGPR slots in `IrBlock`. The SSA builder resolves them like registers, and the translator emits `SetFlag` and `GetFlag` IR ops.
+- Tier 2 must terminate: it performs O(gotos × depth) rewrites. The emitted tree is structured by construction, and tier 1's merge annotation then runs over it without a failure path. If a budget assert fires in tier 2, that is a recompiler bug. A backstop dispatcher loop (`loop { switch (state) {…} }`) is kept only for fuzz triage.
+- Divergence: a flag can be lane-varying, so its uses count as divergent control. `WaveLdsScope` barriers are never placed inside a flag-guarded region. Such a region falls back to workgroup-scope barriers only where the whole workgroup is known to be converged; otherwise it is logged.
+
+**2. Wave size.**
+
+- `SpirvTarget` gains `subgroupSizeControl{minSize, maxSize, requiredStages, fullSubgroups}`, filled from `VkPhysicalDeviceSubgroupSizeControlProperties` (a core feature in Vulkan 1.3, which the reference tier guarantees).
+- Policy per program:
+  - When `waveSize` lies within [min, max] and the stage is in `requiredStages`, emit `laneCount = 1` with subgroup scope, and return `RecompileResult.requiredSubgroupSize = waveSize`. The driver chains `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`, plus `REQUIRE_FULL_SUBGROUPS` for compute when the local X size is a multiple of `waveSize`.
+  - Otherwise, a wave64 program on a 32-wide host keeps the two-lane emulation, and `requiredSubgroupSize = 0`.
+  - A wave32 program on a host with a fixed width above 32 masks the ballot's high bits *(open question: whether any tier device needs this)*.
+- The chosen mode enters the cache key through `target`.
+
+**3. Variant index.**
+
+- `SourceEntry` keeps `code` (for collision checks) and `plan`, and holds an in-tree open-addressing map of `VariantKey → Slot`.
+- `VariantKey` is the 128-bit key defined in [pipeline-cache.md](pipeline-cache.md#target-design) (`SourceKey` plus layout and specialisation). The in-memory index uses the same key as the disk cache. Equality compares the full values, so the hash only indexes.
+- `Slot` holds `shared_future<CompiledVariant>`. The first requester compiles **outside** the source mutex, and concurrent requesters wait on the future.
+- Bounds:
+  - per-source LRU cap `kMaxVariantsPerSource = 64`;
+  - a global byte budget of 256 MiB of SPIR-V plus metadata.
+- Eviction drops the entry from memory only. The disk cache can restore it. Evictions and cap hits feed the telemetry counters `shader.variant_evictions` and `shader.variant_cap_hits`.
+- The result memo (256 LRU) is kept, keyed the same way.
+- Disk keys and `RecompilerVersion` are defined only in [pipeline-cache.md](pipeline-cache.md#target-design). The recompiler builds `SourceKey` from its `RecompileCacheKey` fields and `VariantKey` from `SourceKey`, `BindingLayout` and `ResourceSpecialization`, as specified there, and defines no key of its own.
+- `variantId` stays process-local and never enters SPIR-V, so output is deterministic.
+
+**4. Bindless.**
+
+- M1 ports runtime-indexed descriptor arrays with bounds from device limits. This is a bounds change only: the table size comes from `maxPerStageDescriptorUpdateAfterBindSampledImages` and the table's V# record count, not from a constant, and the `APS5_BINDLESS_*` caps go away.
+- In M4 the table becomes an index into the driver's GPU descriptor heap (`VK_EXT_descriptor_indexing`). The shader probes the driver's T#-address-to-slot hash table (§7), which replaces the CPU material scan, and the recompiler emits `NonUniform` decorations whenever `tableIndexNonUniform` (AnyPS5 `main@75a8668` `SpirvEmitter.cpp:257`) holds.
+
+**5. Kernel idioms.**
+
+- `std::optional<KernelIdiom> AnalyzeKernelIdiom(const IrProgram&)` runs on the post-SSA, post-SRT program for compute stages and is returned in `RecompileResult.idiom`. The recompiler owns `KernelIdiom`.
+- Recognised forms:
+  - `UniformFill{dstBinding, strideBytes, value: UserDataSlots[4], countSource}`;
+  - `LinearCopy{srcBinding, dstBinding, elemBytes, countSource, srcModulo?}`.
+- Proof obligations:
+  - no LDS, atomics or loads other than those in the idiom;
+  - exactly one store per lane;
+  - the address is `base + f(globalInvocationIndex) × stride`, with `f` affine;
+  - the value is uniform, or a single load at the same affine index;
+  - every guard is `index < count`.
+- Recognition is structural, on IR, never on bytes or hashes. The driver owns replacement and verify mode.
+
+**6. Debug surface.**
+
+- AnyPS5 main's switches (`APS5_DUMP_IR`, `APS5_SINGLE_LANE`, `APS5_LOOP_GUARD`, `APS5_PROFILE_DRAW`, …) become the [configuration.md](configuration.md) keys `debug.recompiler.dump_ir` (`["<codeaddr>"|"all"]`), `debug.recompiler.single_lane` and `debug.recompiler.profile`. Request capture is `debug.recompiler.capture`.
+- These keys are diagnostic only. No release run may set them.
+- Every `APS5_NO_*` / `APS5_*_WRITE_FIRST` switch is deleted once its fix passes the corpus.
+- The `v_movrels` select chain costs O(VGPR limit) per access. When M0 is not constant after folding, lower it to a `Function`-storage VGPR array with `OpAccessChain` instead.
+
+**7. Driver-side data paths.** The recompiler must emit code for three driver contracts ([gpu-driver.md](gpu-driver.md)):
+
+- **V#/SRT loads through BDA (M3).** The shader loads the V# and the SRT chain from guest memory at execute time through the BDA page table, using the `bdaAbiVersion` ABI, instead of the driver reading them on the CPU at record time. Out-of-range pointers resolve to the driver's fault buffer.
+- **SGPR user data from a buffer (M3).** SGPRs that the CP's patch does not fold (for example indirect-draw fields) are read from a per-draw user-data buffer instead of push constants.
+- **Descriptor-heap hash probe (M4).** For bindless tables, the shader probes the driver's GPU hash table from T# address to heap slot (§4).
+
+## Interfaces
+
+| With | Contract |
+|---|---|
+| [gpu-driver.md](gpu-driver.md) | `ResolveSource`, `CaptureResources` and `Recompile(request, capture)` (AnyPS5 main API, from merged PR #5) stay the entry points. `RecompileResult` gains `requiredSubgroupSize` and `idiom` (`KernelIdiom`). A recompile or plan failure aborts via `Unsupported()`, so there is no failure status for the driver to handle. Today the recompiler reads guest memory only through `RequestMemoryView` captures; the target adds the GPU-side paths of §Target design 7 (BDA V#/SRT loads, the user-data buffer, the heap probe). The driver creates pipelines and applies idiom replacement. |
+| [pipeline-cache.md](pipeline-cache.md) | Owns `RecompilerVersion`, `SourceKey` and `VariantKey`. The recompiler builds those keys as specified there and exports `SerializeVariant` and `DeserializeVariant` (SPIR-V, bindings, stage metadata). The cache is authoritative across runs, and in-memory eviction relies on it. |
+| [verification.md](verification.md) | The `recompiler-golden` job: `agc_shader_replay --golden <dir>` diffs **pre-optimizer** SPIR-V disassembly and runs `spirv-val` on both pre- and post-optimizer modules. Local regression step 4 replays the local corpus. The `policy` job bans `getenv` in `core/shader`. |
+| [build-toolchain.md](build-toolchain.md) | `ANYPS5_ENABLE_SPIRV_TOOLS` is ON in the `dev` and `ci` presets. The release default is currently off, pending PRD R1. `DummyShaders.cpp` moves into a test target, so glslang is test-only. The `golden` ctest label and `ctest --preset golden` entry point. The synthetic corpus is hand-assembled dwords (field layouts cited to the decoder sources in `tests/golden/SyntheticCorpus.hpp`), checked in as `.req` plus `.spvasm` under `tests/golden/corpus/`; no `.s` sources and no `llvm-mc` pin (the hand-assembled form removes the build-time tool entirely). `.req` files are generated with `agc_shader_replay --dump-corpus`, goldens with `--golden <dir> --update-goldens`. |
+| [configuration.md](configuration.md) / telemetry | `debug.recompiler.dump_ir`, `debug.recompiler.single_lane`, `debug.recompiler.profile`, `debug.recompiler.capture` (diagnostic only). Counters: `spirv_compilations` (also the results JSON field), `shader.compile_ms`, `shader.structurizer_tier2`, `shader.variant_evictions`, `shader.variant_cap_hits`. `spirv_compilations` feeds F7's "0 compilations with a warm cache". |
+
+## Failure modes
+
+| Failure | Detection | Behaviour |
+|---|---|---|
+| Tier 1 structurizer cannot place a merge | `Unstructurable` result | Tier 2. Counted, never skipped. |
+| Tier 2 budget assert | fuzz or corpus | Recompiler bug: dump the `.req` and fail the test. At runtime, log once with the program hash and abort via `Unsupported()` (see the next row). |
+| Unsupported opcode or unresolvable SRT chain (any recompile or plan failure) | exception carrying the serialized request | Log once with the program hash and abort via `Unsupported()`. No skip, no failure memo and no counted tolerance, in any mode. |
+| Source-key hash collision | word-by-word code compare (`main@75a8668`) | A second bucket entry, which is correct. Counted. |
+| Variant explosion (for example descriptor churn) | `variant_cap_hits` | LRU eviction and a disk reload. *Open: whether a despecialised variant is feasible.* |
+| `spirv-val` or optimizer failure | SPIRV-Tools | A recompile failure: log once with the program hash and abort via `Unsupported()`. In a build without SPIRV-Tools (the current release default), the driver's capability check (`Graphics/src/ShaderValidation.cpp`) is the last guard. |
+| Subgroup size not honoured by the driver | pipeline creation fails, or a debug-mode ballot self-check | Fall back to `laneCount = 2` for that stage and log once. |
+| Golden drift from a SPIRV-Tools bump | golden diff on post-opt output | Not possible: goldens are taken before the optimizer. |
+
+## Tests
+
+- **GoogleTest Unit Suites** (`recompiler_fixes_tests` and `recompiler_ported_instruction_tests`, label `unit`; `recompiler_golden_tests`, label `golden`; all registered in `core/libs/prx/libSceAgcDriver/CMakeLists.txt:437-456`):
+  - [ ] Decoder round-trip per opcode encoding with parameterized tests (`TEST_P`).
+  - [ ] `ValidateProgram` negative cases.
+  - [ ] SSA with synthetic flags.
+  - [ ] Tier 1 and tier 2 structurizer on hand-built CFGs (diamond, multi-latch, shared merge, the two irreducible entries, a goto into a loop).
+  - [ ] Variant index: bound, eviction, concurrent single compile.
+  - [ ] Key stability: the same request gives the same `SourceKey` and `VariantKey` ([pipeline-cache.md](pipeline-cache.md#target-design)) across processes.
+  - [ ] Idiom analysis, positive and negative.
+  - [ ] Emission of BDA V#/SRT loads, user-data-buffer SGPR reads and the heap probe (§Target design 7).
+  - [x] Regression tests for saveexec `(vcc, vcc)`, atomic-zero, `v_movrels` and wave-LDS scope (`RecompilerFixesTests`),
+    including divergent-write barriers at reconvergence merge blocks, divergent-read barriers at
+    outermost uniform headers (`DivergentRegionLdsReadOrdersPriorWritesAtUniformHeader`,
+    `DivergentWriteThenReadInSameBlockGetsHeaderAndMergeBarriers`), and the cyclic-header skip
+    (`DivergentReadWithCyclicHeaderSkipsPreReadBarrier`).
+  - [x] `s_getpc_b64` names the shader's absolute address (`GetShaderBase` + next-PC offset, ported
+    from upstream `d9ac21c`): PC-relative data behind the shader's own code resolves to the real
+    data instead of near-zero, and relocated copies keep sharing one variant
+    (`SGetpcB64AddsShaderBaseToNextPc`).
+  - [x] Lane E instruction ports (`recompiler_ported_instruction_tests`): V_PERM_B32, scalar cmov/bcnt0/ff0/sext/brev64/ashr64/bitcmp64,
+    64-bit saveexec family and aliased-source/per-lane-EXEC ordering, S_CLAUSE and debug branches, SDWA on bfrev/ffbh,
+    64-bit constant widening, f16 inline constants and op_sel, VOP3 carry-in, MIMG UNORM, BDA lookup `DontInline`,
+    IR value flag equality.
+  - [x] Lane E2 ports (`recompiler_ported_instruction_tests`): DPP row/bank/bound_ctrl write gating per lane against an independent ISA
+    model, mac accumulator not DPP-moved, `s_or/xor/andn2_saveexec_b32`, `s_bcnt0/ff0_i32_b64`, GLC/DLC coherent buffer stores
+    (Coherent decoration and Volatile access, DLC bit decode), MRT 32_R/32_GR/32_AR export masks and SNORM16/UNORM16/FP16
+    unpack selection, structurizer termination on a selection whose arm continues, and BDA access in a loop continue target
+    (a wrapped address there is poisoned to all ones: `WrappedBdaAddressInContinueTargetIsPoisoned`).
+  - [x] Stage gate: `SharedMemoryBarrierInserter` inserts barriers only for compute, mesh, and
+    tessellation-control stages (Workgroup execution scope is invalid elsewhere), covered by
+    `Wave64VertexStageSkipsBarrierInsertion` and `TessellationControlStageInsertsBarrier`.
+  - [ ] Death tests (`EXPECT_DEATH`): verify that unresolvable opcodes trigger an immediate logging abort via `Unsupported()` without memory corruption.
+- **Ported Ecosystem Test Suites:**
+  - [ ] **KytyPS5 `ShaderRecompilerComputeTests`:** comprehensive RDNA2 instruction lowering, resource descriptor bindings, texture sampling modes, and atomic memory operations.
+  - [ ] **KytyPS5 `shaderCfgTests`:** advanced control-flow graphs, loop structuring, loop termination conditions, and complex nested branching topologies.
+  - [ ] **Mesa ACO GFX10.3 Test Suite (`src/amd/compiler/tests`):** bitfield-exact RDNA2 instruction decoding, DPP swizzles, SDWA packing, 64-bit LDS instructions, and divergent control-flow reconvergence.
+  - [ ] **SharpEMU Packed ALU Suites:** packed 16-bit math (`VopcF16`), 3-input XOR (`ThreeInputXor`), and 24-bit signed multiplication (`SignedMultiply24`).
+- [x] **Synthetic golden corpus** (hosted): project-written dwords only, never game bytecode
+  (`core/shader/recompiler/tests/golden/`, corpus in `corpus/`, replayed two ways: the
+  `recompiler_golden_tests` GTest suite and `agc_shader_replay --golden <dir>`).
+  - Coverage gate: every `RdnaOpcode` the decoder accepts appears in at least one request, and CI fails when a decoded class (SOP1/SOP2/SOPK/SOPC/SOPP/SMEM/VOP1/VOP2/VOP3/VOPC/VOP3P/DS/MUBUF/MTBUF/MIMG/FLAT/EXP) has no request.
+  - Each variant is replayed with a wave32 and a wave64 target. The with/without subgroup
+    size control axis arrives with the M4 subgroup-size-control path (Target design §2);
+    until then the corpus pins `subgroupSize` to the wave size.
+  - Golden diffs compare the disassembly of the final validated module (the `Recompile`
+    contract returns post-optimizer SPIR-V when SPIRV-Tools are on). Goldens therefore pin
+    the SPIRV-Tools version; regenerate deliberately with `--update-goldens` after review.
+    Comparisons normalize CRLF (Windows checkouts) against the LF-only disassembler output,
+    and replaying zero requests fails, so CI can never pass on a wiped corpus.
+- **Fuzz** (hosted, fixed seeds, plus a nightly local run): a random CFG generator emits `s_branch` / `s_cbranch_*` programs, including irreducible ones, and mutates corpus CFGs. Oracle: 0 structurizer throws, `spirv-val` passes, and an interpreter over IR matches an interpreter over the RDNA CFG on the branch trace for random SGPR inputs.
+- **Local game-derived corpus:** `.req` files captured under `debug.recompiler.capture = true`. They stay on the maintainer machine (verification.md §2), and the pass condition is 0 validation failures and no `Unsupported()` abort.
+
+## Milestones
+
+| Milestone | Recompiler deliverables | Exit evidence |
+|---|---|---|
+| M0 | - [x] C++23 flag. The recompiler suites (`recompiler_fixes_tests`, `recompiler_ported_instruction_tests`, `recompiler_golden_tests`) and `agc_shader_memory_tests` in ctest. glslang made test-only. | ctest green |
+| M1 | - [ ] Port `87911b3` and the flat-slot and hashed-key parts of `29b4601`. Bindless tables with bounds taken from device limits (bean `portps5-7li6`). Remove every `APS5_*` read (done: none remain in `core/`).<br>- [x] `agc_shader_replay` and serializer (adapted port: no env switches, return codes).<br>- [x] The `recompiler-golden` job.<br>- [x] The synthetic corpus. | M1 exit: every decoded class covered and green in CI, local corpus with 0 failures, DeS fill/copy kernels running as compiled shaders |
+| M2 | - [ ] `SourceKey`/`VariantKey` as defined in [pipeline-cache.md](pipeline-cache.md#target-design), and variant (de)serialisation for the disk cache. Depth and sample-mask export verified. | 0 `spirv_compilations` with a warm cache (F7) |
+| M3 | - [ ] Tier 2 structurizer. Bounded hash-indexed variants that compile outside the lock. V#/SRT loads on the GPU through BDA. SGPRs read from the user-data buffer. | Fuzz corpus with 0 structurizer throws |
+| M4 | - [ ] Subgroup size control. `AnalyzeKernelIdiom` (`KernelIdiom`). Bindless on the GPU heap through the descriptor-heap hash probe, replacing the CPU material scan. | Bugsnax full run |
+| M5 | - [ ] Optimizer pass-list tuning, measured against `shader.compile_ms` during cold runs | Perf bar |
+| M6 | - [ ] R1 status: record whether the release binary contains SPIRV-Tools | Release notes |
+
+**Relink-time AOT stays post-1.0.** Four things block it:
+
+1. Variants specialise on descriptor contents read from guest memory at dispatch time (`Recompiler.cpp:286-287`).
+2. Stage context (interpolators, vertex fetch, LDS size, wave size) comes from PM4 register state that exists only at draw time.
+3. Shader code can live in data files loaded at runtime rather than in the ELF *(inferred)*.
+4. The SPIR-V depends on the target device.
+
+A post-1.0 path pre-warms the disk cache from a recorded `.req` corpus.
+
+## Open questions
+
+1. Can a despecialised generic variant stand in once a source hits the variant cap?
+2. Does any wave32 program run on a host whose subgroup is fixed wider than 32?
+3. Follow-up to PR #36 (bean portps5-habc): `EmitGetShaderBase`
+   (`SpirvBackend/src/SpirvModuleEmitter.cpp:1064`) still emits constant zero, so
+   SPIR-V consumers of an `s_getpc_b64` value see offset-only while the
+   SRT/resource-tracker path (via `MakeRuntime` with `request.shader.codeAddress`)
+   names the real base — same limitation as upstream. The fix is dispatch-time
+   delivery of the code address (per-dispatch shader data or push constants), never
+   baked into the shared variant.
+4. Does the M1 intro-cinematic stage require bindless tables? The message of commit `29b4601` says so *(unverified)*.
+5. Should tier 2 run eagerly in CI for every corpus shader, to find divergence bugs before games do?
+6. Choice of XXH3: vendoring it (BSD-2) versus an in-tree hash.
+7. Intra-divergent-region cross-lane LDS ordering: `SharedMemoryBarrierInserter` orders divergent writes
+   at reconvergence merges and divergent reads at outermost uniform headers (skipped when the header
+   lies on a control-flow cycle, where per-iteration execution under divergent loop control would break
+   barrier uniformity). A divergent write followed by a divergent read in the SAME region with no
+   intervening uniform point cannot be ordered by any workgroup barrier, by uniformity: every point
+   after the write and before the read is skipped by lanes not taking the branch, so a barrier there is
+   dynamically non-uniform (deadlock/UB) instead of ordering. Same-lane write-then-read needs no barrier
+   (program order) and is unaffected. The M3 fix is a structurizer transform, not barrier placement:
+   split the region with an intermediate reconvergence (barrier at the intermediate merge, which all lanes
+   execute) and re-diverge on the same condition for the read. Loop-carried LDS ordering across iterations
+   of a divergently-controlled loop is likewise deferred to M3 (it needs loop-latch uniformity analysis).
+8. Lane E follow-ups not ported: 64-bit *floating-point* operands with a literal constant take the literal as the
+   high dword of the double (low dword zero) on hardware, while `readU32Pair` zero-extends it (correct for integer
+   operands only). No 64-bit float opcode exists in the tree yet, so nothing is wrong today; the first f64 consumer
+   must read its literal as the high dword (it needs the consuming opcode's type; bean `portps5-51d6`). Upstream's `_a` sample aliases
+   (`8e66145`) need ISA verification, and the `_cl` LOD clamp needs the device's `shaderResourceMinLod` in
+   `SpirvTarget::supportedCapabilities` (AGC driver). Lane E2 ported the rest of that commit and the previously
+   undecoded scalar ops.
+9. Upstream's buffer-atomic zero-identity rewrite (`87911b3`: add/sub/or/xor of 0 become an atomic load or nothing)
+   was tuned to one title's access pattern and is data-dependent at run time; it stays out until a general
+   justification (mechanism, measurements and a memory-ordering argument) exists.
+10. FLAT/GLOBAL loads carry GLC/DLC too (`flat_load_dword ... glc`); only MUBUF/MTBUF accesses are mapped to coherent
+    storage-buffer accesses so far. The BDA path would need `Volatile` on its physical-storage loads.
+11. Loop continue targets and SPIRV-Tools: when the single guest block of a loop is the continue target and contains a
+    selection (any bounds-checked buffer access or guest-memory read under EXEC), the module passes `spirv-val` before
+    optimization but the optimizer's `merge-blocks` pass produces a module that fails validation ("continue construct ...
+    not structurally post dominated by the back-edge block"). Reproduced with a plain `buffer_store_dword` in a counting
+    loop, so it predates and is independent of the BDA fix above. Release builds (no SPIRV-Tools) are unaffected. A fix is an
+    emitter change (a dedicated empty continue block after the guest latch) or an optimizer pass-list change; either needs
+    the golden corpus to carry a loop case first.
+12. Deferred upstream items that need an AGC driver hook, listed in the lane E2 table: GPU-computed V# access
+    (`21cb5676`, `74454ee9`, `3d3f7122`, `029dcdac`), partial thread-dimension dispatch (`000d0bf4`), the `shaderResourceMinLod`
+    capability for `_cl` samples, and the D32-bits-as-integer texture read (`c1692bf9`).
+13. DPP with `bound_ctrl = 0` and a source lane that is in range but disabled by EXEC: the backend writes the lane with a zero
+    source (`EmitDppWriteCondition` ignores the source lane's EXEC), while the ISA may treat a disabled source lane like an
+    invalid one. The lane E2 tests keep all lanes active, so the case is not pinned either way; confirm against the ISA before
+    relying on it.
+14. Release-build optimization: release builds ship without SPIRV-Tools (PRD R1), so release SPIR-V gets only stage 6 cleanup. Planned native passes: GVN/CSE, copy propagation and control-flow simplification (bean `portps5-t5qa`), uniformity analysis (`portps5-1uym`), and draw-state specialization constants keyed in `VariantKey` (`portps5-9gsx`). A spike checks whether `spirv-opt` can run as a separate process (`portps5-m5n7`). Compile time is measured as `shader.compile_ms` (`portps5-tg51`).
